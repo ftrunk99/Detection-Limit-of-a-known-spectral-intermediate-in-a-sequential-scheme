@@ -1,0 +1,1257 @@
+%% tyr_intermediate_limit_v4_1.m 
+% Detection limit for a hidden TyrOH.+ hopping intermediate in transient-absorption data
+% -------------------------------------------------------------------------------------
+% Question: an electron-transfer step shows no resolvable rise lag. How large could a
+% sequential intermediate between two states be and still go unnoticed?
+%
+% Model
+%   Chain:   species 1 (FAD*) -> species 2 -> ... -> last species (does not decay).
+%            All species spectra are free, the lifetimes are fitted (cfg.tau0).
+%   Early:   optional extra components that decay in parallel with free spectra and
+%            lifetimes (cfg.tauEarly), meant for early dynamics when the
+%            window starts near time zero.
+%   Tested:  an intermediate I between species cfg.intPos and cfg.intPos+1. Its
+%            spectrum is tied to the species that follows it:
+%               S_I = S_following + cL*eps(intermediate radical) - cFin*eps(final radical)
+%            cL and cFin are read from the spectrum of that following species.
+%
+% Steps
+%   1. Fit without intermediate.   2. cL and tied spectrum.   3./4. Profile scan of the
+%   intermediate lifetime tau2 on the measured data.   5. Bootstrap: false-alarm
+%   threshold, detection probability per injected tau2, confidence intervals.
+%   6. Simulated traces and concentration profiles.   7. Optional comparison with a
+%   reference sample.   8. Results as matrices (cfg.resultsFile, CSV).   9. Figures.
+%
+% 
+%   The .ana created for cross validation using OPTIMUS file has the TAVIS layout: 
+%   (%FILENAME, %DATATYPE, %NUMBERSCANS, %TIMESCALE,
+%   %TIMELIST, %WAVELENGTHLIST, %INTENSITYMATRIX). 
+%   Optionally the measured delays before
+%   cfg.tmin are put in front, so the file has the full time axis.
+%
+%   cfg.anaExport   writes one simulated data set (fitted model + injected intermediate +
+%                   resampled noise) as an .ana text file, by default at the detection limit.
+%
+% 
+%   cfg.intPos      puts the intermediate between other states (1 = as before).
+%   cfg.tauEarly    adds one or two early components; use with a small cfg.tmin.
+%   cfg.noiseEdges  keeps early and late noise apart in the bootstrap.
+%
+% Read this before starting near time zero
+%   - No instrument response is modelled. Keep cfg.tmin a few IRF widths above zero
+%     (for example 0.2 ps).
+%   - A free early component swallows the rise of an intermediate with a similar
+%     lifetime. 
+%   - With an early window, lower cfg.bootGrid and cfg.tauInject, for example
+%     cfg.bootGrid = logspace(log10(0.15), log10(6), 14) and
+%     cfg.tauInject = [0.3 0.5 0.8 1.0 1.2 1.5 1.8] are required. Always
+%     check bootGrid vs tauInject and match them to the injection scheme.
+%
+% Requirements: MATLAB R2019a or newer, no toolboxes.
+% Units: time in ps, wavelength in nm, spectra in mOD, reference spectra in mM^-1 cm^-1,
+%        cL in uM cm. Populations are calculated as fractions of the excited FAD.
+%
+% 
+
+cfg = struct();
+
+%% ------------------------------- settings ------------------------------------------
+cfg.dataFile   = 'TA_dataWT.xlsx';   % rows = delays, columns = wavelengths of Dispersion and IRF corrected data 
+cfg.refFile    = 'Spectral_references_from_literature_of_FAD_intermediates.xlsx'; %Table of epsilon of literature reference data/intermediates
+cfg.toMilliOD  = 1e3;          % data are in OD -> factor to mOD (use 1 if already mOD)
+cfg.tmin       = 0.3;          % ps, start of the fit window; no IRF is modelled, stay above ~0.2 ps
+cfg.tPre       = -0.4;         % ps, delays before this are used for the first noise estimate
+cfg.exclude    = [465 483];    % nm, one row per range to leave out (pump scatter)
+cfg.tau0       = [7 30 1000];  % ps, start values of the chain lifetimes (FAD* decay first)
+cfg.tauEarly   = [0.4 2];           % ps, start values of extra early components (parallel decays with
+                               % free spectra): [] = none, 0.7 = one, [0.3 1.5] = two
+cfg.intPos     = 1;            % the tested intermediate sits between species intPos and intPos+1
+                               % (1 = between FAD* and its product, 2 = between species 2 and 3)
+cfg.noiseEdges = [];           % ps, the bootstrap resamples noise only within the delay ranges
+                               % separated by these edges; set 3 when the window starts before 3 ps
+
+% columns of the reference sheet (1 = wavelength)
+cfg.colRed     = 2;            % FAD.-
+cfg.colOx      = 3;            % FADox
+cfg.colFinal   = 5;            % TrpH.+   (radical of the final state)
+cfg.colInt     = 8;            % TyrOH.+  (radical of the intermediate); 6 = neutral TyrO.
+
+cfg.fitRange   = [380 670];    % nm, range used to estimate cL from the spectrum of P
+cfg.cL         = [];           % uM cm; [] = estimate from the data
+cfg.trpMode    = 'fitted';     % 'fitted'  : TrpH.+ amount as found in the spectrum of P
+                               % 'oneToOne': one TrpH.+ per FAD.- with the
+                               % literature epsilon
+                               % 'none'    : use the TyrOH.+ band only
+cfg.tau2grid   = logspace(log10(0.05), log10(6), 43);   % ps, profile scan
+cfg.bound      = 3;            % null lifetimes may change by at most this factor in the scan (e.g. to compensate the injected lifetime)
+
+cfg.nBoot0     = 400;          % bootstrap replicates without intermediate
+cfg.nBoot1     = 150;          % replicates per injected lifetime
+cfg.bootGrid   = logspace(log10(0.3), log10(6), 14);    % ps, tau2 grid inside the bootstrap
+cfg.tauInject  = [0.6 0.8 1.0 1.2 1.4 1.6 1.8 2.0 2.5 3.0];   % ps
+cfg.seed       = 1;
+cfg.ciLevel    = 0.95;         % level of all confidence intervals
+
+% traces and concentration profiles 
+cfg.traceWl    = [400 450 550 580];   % nm, the nearest kept pixel is used
+cfg.traceTmax  = 100;          % ps, right end of the time axis in the trace figures
+cfg.concTmax   = 200;          % ps, end of the concentration profiles (they start at 0)
+
+% optional reference sample without TyrOH.+ (same file layout as cfg.dataFile)
+cfg.refDataFile = 'TA_data_refnoTyrOH(Y-F).xlsx';          %  '' = skip part 7
+cfg.refTau0     = [15 30 1000];% ps, start values for that sample
+cfg.refTauEarly = [];          % ps, early components of that sample; [] = same as cfg.tauEarly
+cfg.refIntPos   = [];          % position in the reference chain; [] = same as cfg.intPos
+cfg.cmpRange    = [380 660];   % nm, range for the comparison of the FAD* spectra
+cfg.nBootCmp    = 200;
+
+% output and export of results
+cfg.resultsFile = 'results.mat';        % all results as plain matrices
+cfg.exportCsv   = true;                 % the same matrices as CSV files with headers
+cfg.exportDir   = 'tyr_limit_export';   % folder for CSV files and figures
+cfg.saveFigures = true;                 % PNG files of all figures
+
+% simulated data set with injected intermediate, written as .ana (TAVIS) file;
+% values in the units of cfg.dataFile (OD), one row per delay
+cfg.anaExport      = true;
+cfg.anaFile        = 'simulated_injection.ana';
+cfg.anaTau         = [];        % ps; [] = detection limit (95 % detection probability)
+cfg.anaNumberScans = 1;         % value written in %NUMBERSCANS
+cfg.anaDigits      = 5;         % significant digits of all numbers (5 as in the measured files)
+cfg.anaIncludeEarly = false;    % true = measured delays before cfg.tmin are put in front
+                                % (unchanged measurement there, simulation from cfg.tmin on)
+cfg.anaSeed        = [];        % [] = continue the random sequence; a number = fixed noise draw
+cfg.anaNoiseFree   = true;      % also write the same data without noise (_noisefree.ana)
+
+rng(cfg.seed);
+aLev = 1 - cfg.ciLevel;
+zc   = sqrt(2) * erfinv(cfg.ciLevel);   % 1.96 for 95 %
+
+%% ------------------------------- load ----------------------------------------------
+[t, wl, A] = readta(cfg.dataFile, cfg.toMilliOD);
+R = readref(cfg.refFile);
+try
+    hdr = readcell(cfg.refFile, 'Range', 'A1:J1');
+    fprintf('Reference columns used: FAD.- = "%s", FADox = "%s", final = "%s", intermediate = "%s"\n', ...
+        cell2txt(hdr{cfg.colRed}), cell2txt(hdr{cfg.colOx}), cell2txt(hdr{cfg.colFinal}), cell2txt(hdr{cfg.colInt}));
+catch
+    fprintf('Reference columns used (by number): %d %d %d %d\n', cfg.colRed, cfg.colOx, cfg.colFinal, cfg.colInt);
+end
+
+keep = true(size(wl));
+for i = 1:size(cfg.exclude, 1)
+    keep = keep & ~(wl >= cfg.exclude(i,1) & wl <= cfg.exclude(i,2));
+end
+sd0 = std(A(t < cfg.tPre, keep), 0, 1);
+if any(sd0 == 0) || any(isnan(sd0))
+    error('A kept wavelength has zero or undefined noise before time zero. Add it to cfg.exclude.');
+end
+m  = t >= cfg.tmin;
+tt = t(m);                 % nt x 1
+ww = wl(keep);             % 1 x nl
+Y  = A(m, keep);           % nt x nl
+[nt, nl] = size(Y);
+Z  = zeros(1, nl);
+fprintf('Fit window: %.2f to %.0f ps (%d delays), %d wavelengths from %.0f to %.0f nm\n', ...
+    tt(1), tt(end), nt, nl, ww(1), ww(end));
+
+mdl = struct('nChain', numel(cfg.tau0), 'nEarly', numel(cfg.tauEarly), 'intPos', cfg.intPos);
+if cfg.intPos < 1 || cfg.intPos > mdl.nChain || cfg.intPos ~= round(cfg.intPos)
+    error('cfg.intPos must be a whole number between 1 and the number of lifetimes in cfg.tau0.');
+end
+ip  = cfg.intPos;                      % species in front of the intermediate
+nCh = mdl.nChain;
+grp = noisegroups(tt, cfg.noiseEdges); % delay ranges for the noise resampling
+if ip == 1
+    precName = 'FADstar';  precLabel = 'FAD*';
+else
+    precName = sprintf('species%d', ip);  precLabel = sprintf('species %d', ip);
+end
+
+%% ------------------------------- 1. null model -------------------------------------
+[pN, chiN, w, S, C, Rw] = nullfit(tt, Y, sd0, [cfg.tau0(:); cfg.tauEarly(:)]', mdl);
+dof = numel(Y) - numel(pN) - numel(S);
+tauN = 1 ./ exp(pN(:)');               % chain lifetimes first, then the early components
+nRate = numel(pN);
+fprintf('\nModel without intermediate: chain of %d species', nCh + 1);
+if mdl.nEarly > 0, fprintf(' plus %d early component(s)', mdl.nEarly); end
+fprintf('\n  chain lifetimes: %s ps\n', sprintf('%.2f  ', tauN(1:nCh)));
+if mdl.nEarly > 0, fprintf('  early lifetimes: %s ps\n', sprintf('%.2f  ', tauN(nCh+1:end))); end
+fprintf('  intermediate tested between species %d and %d\n', ip, ip + 1);
+fprintf('  chi2 = %.0f for %d degrees of freedom (weights are rescaled so that this is ~1 per point)\n', chiN, dof);
+fprintf('  median noise per point, 410-620 nm: %.3f mOD\n', median(1 ./ w(ww >= 410 & ww <= 620)));
+
+%% ------------------------------- 2. cL and tied spectrum ---------------------------
+binw = median(diff(wl));
+eRed = binref(R(:,1), R(:,cfg.colRed),   ww, binw);
+eOx  = binref(R(:,1), R(:,cfg.colOx),    ww, binw);
+eFin = binref(R(:,1), R(:,cfg.colFinal), ww, binw);
+eInt = binref(R(:,1), R(:,cfg.colInt),   ww, binw);
+mk = ww >= cfg.fitRange(1) & ww <= cfg.fitRange(2);
+B  = [(eRed(mk) - eOx(mk))', eFin(mk)'];
+Bw = B .* w(mk)';
+x  = lsqnonneg(Bw, (S(ip+1,mk) .* w(mk))');   % species that follows the intermediate
+if isempty(cfg.cL), cL = x(1); else, cL = cfg.cL; end
+switch cfg.trpMode
+    case 'fitted',   cFin = x(2);
+    case 'oneToOne', cFin = cL;
+    case 'none',     cFin = 0;
+    otherwise, error('Unknown cfg.trpMode');
+end
+Delta = cL * eInt - cFin * eFin;          % 1 x nl, mOD per unit population of I
+[~, iPk] = max(eInt);
+fprintf('\nFAD.- in species %d: cL = %.3f uM cm; final radical there: %.3f uM cm (%.0f %% of cL)\n', ip + 1, cL, x(2), 100 * x(2) / cL); %calculates the amount of reduced FAD after ES decay
+fprintf('  A full population of the intermediate would add %.2f mOD at %.0f nm\n', Delta(iPk), ww(iPk)); %calculates the maximum signal a injected intermedate could reach when populated by FAD oxidation and no intrinsic decay 
+
+%% ------------------------------- 3./4. profile scan --------------------------------
+lo = pN - log(cfg.bound);
+hi = pN + log(cfg.bound);
+ng = numel(cfg.tau2grid);
+prof = zeros(ng, 4);                      % tau2, dchi2, lifetime of the preceding species, peak population in sequential scheme
+p = pN;
+for g = 1:ng
+    tau2 = cfg.tau2grid(g);
+    [p1, c1] = fitmodel(tt, Y, w, Delta, tau2, p,  lo, hi, mdl);
+    [p2, c2] = fitmodel(tt, Y, w, Delta, tau2, pN, lo, hi, mdl);
+    if c1 <= c2, p = p1; c = c1; else, p = p2; c = c2; end
+    prof(g,:) = [tau2, c - chiN, 1 / exp(p(ip)), intStats(exp(p(1:nCh))', tau2, ip)];
+end
+[dmin, imin] = min(prof(:,2));
+fprintf('\nProfile scan: smallest dchi2 = %.1f at tau2 = %.2f ps\n', dmin, prof(imin,1));
+
+%% ------------------------------- 5. bootstrap --------------------------------------
+P = struct('t', tt, 'w', w, 'Delta', Delta, 'pN', pN, 'lo', lo, 'hi', hi, ...
+           'grid', cfg.bootGrid, 'S', S, 'Bw', Bw, 'mk', mk, 'mdl', mdl);
+noiseRows = (Rw ./ w) * sqrt(numel(Y) / dof);
+M0 = C * S;
+
+fprintf('\nBootstrap without intermediate (%d replicates) ', cfg.nBoot0);
+H0     = zeros(cfg.nBoot0, 3 + nRate);    % T, E (unused here), r projection, lifetimes
+S1boot = zeros(cfg.nBoot0, nl);           % spectrum of the preceding species in each replicate
+cLboot = zeros(cfg.nBoot0, 2);            % cL and final radical of each replicate
+for b = 1:cfg.nBoot0
+    [H0(b,:), S1boot(b,:), cLboot(b,:)] = bootstats(M0 + drawnoise(noiseRows, grp), P, []);
+    if mod(b, 50) == 0, fprintf('.'); end
+end
+fprintf('\n');
+Tcrit = quantLinear(H0(:,1), 0.95);
+obs   = bootstats(Y, P, []);
+Tobs  = obs(1);
+pval  = mean(H0(:,1) >= Tobs);
+sdTau = std(H0(:,4:end), 0, 1);
+sdR   = std(H0(:,3));
+
+k  = exp(pN(:)');
+kc = k(1:nCh);                            % chain rates
+nq = numel(cfg.tauInject);
+T1 = zeros(cfg.nBoot1, nq);               % detection statistic of every injected replicate
+E1 = zeros(cfg.nBoot1, nq);               % dchi2 at the true tau2
+fprintf('Bootstrap with injected intermediate (%d replicates each)\n', cfg.nBoot1);
+for q = 1:nq
+    tau = cfg.tauInject(q);
+    [C1, I1] = designMatrix(tt, pN, tau, mdl);
+    M1  = C1 * S + I1 * Delta;
+    for b = 1:cfg.nBoot1
+        h = bootstats(M1 + drawnoise(noiseRows, grp), P, tau);
+        T1(b,q) = h(1);
+        E1(b,q) = h(2);
+    end
+    fprintf('  tau2 = %4.1f ps   peak population %5.1f %%   detected in %5.1f %%\n', ...
+        tau, 100 * intStats(kc, tau, ip), 100 * mean(T1(:,q) > Tcrit));
+end
+
+%% ------------------------------- 5b. confidence intervals --------------------------
+% lifetimes, cL and the spectrum of the preceding species: percentiles of the bootstrap replicates
+ciTau  = [quantCols(H0(:,4:end), aLev / 2); quantCols(H0(:,4:end), 1 - aLev / 2)];
+ciCL   = [quantCols(cLboot, aLev / 2); quantCols(cLboot, 1 - aLev / 2)];
+sdCL   = std(cLboot, 0, 1);
+sdS1   = std(S1boot, 0, 1);
+ciS1   = [quantCols(S1boot, aLev / 2); quantCols(S1boot, 1 - aLev / 2)];
+
+% false-alarm threshold: interval of the 95 % quantile from its rank uncertainty
+seQ     = sqrt(0.95 * 0.05 / cfg.nBoot0);
+TcritLo = quantLinear(H0(:,1), max(0, 0.95 - zc * seQ));
+TcritHi = quantLinear(H0(:,1), min(1, 0.95 + zc * seQ));
+
+% detection probability: Wilson interval, widened by the uncertainty of the threshold
+pw = zeros(nq, 8);    % tau2, peak pop, late ratio I/preceding, detection prob, ciLow, ciHigh, e95, expected dchi2
+for q = 1:nq
+    tau  = cfg.tauInject(q);
+    pHat = mean(T1(:,q) > Tcrit);
+    pLo  = wilson(mean(T1(:,q) > TcritHi), cfg.nBoot1, zc);
+    [~, pHi] = wilson(mean(T1(:,q) > TcritLo), cfg.nBoot1, zc);
+    [pkq, ~, lrq] = intStats(kc, tau, ip);
+    pw(q,1:7) = [tau, pkq, lrq, pHat, min(pLo, pHat), max(pHi, pHat), quantLinear(E1(:,q), 0.95)];
+end
+thrEx   = max(pw(:,7));
+thrExLo = min(pw(:,7));
+
+% detection limit (95 % detection probability) with interval
+tauDet   = interpCross(pw(:,1), pw(:,4), 0.95);
+tauDetLo = interpCross(pw(:,1), pw(:,6), 0.95);     % optimistic end
+tauDetHi = interpCross(pw(:,1), pw(:,5), 0.95);     % pessimistic end
+popDet = NaN; popDetLo = NaN; popDetHi = NaN;
+if ~isnan(tauDet),   popDet   = intStats(kc, tauDet, ip);   end
+if ~isnan(tauDetLo), popDetLo = intStats(kc, tauDetLo, ip); end
+if ~isnan(tauDetHi), popDetHi = intStats(kc, tauDetHi, ip); end
+
+% exclusion from the measured data: crossing of the calibrated threshold
+[tauEx, popEx, allAbove] = crossProfile(prof, thrEx);       % conservative threshold
+[tauExLo, popExLo]       = crossProfile(prof, thrExLo);     % smallest calibrated threshold
+
+%% ------------------------------- 6. simulated traces and concentrations ------------
+% 6a. noise-free TA with an injected intermediate, refitted WITHOUT intermediate.
+%     simAdded      = what the injection changes in the TA
+%     simUnabsorbed = what is left after the free spectra and lifetimes have adapted;
+%                     only this part can be detected
+[~, ixTr] = min(abs(ww(:) - cfg.traceWl(:)'), [], 1);   % nearest kept pixel
+nTr = numel(ixTr);
+simInjected  = zeros(nt, nl, nq);
+simNullRefit = zeros(nt, nl, nq);
+forcedFit    = zeros(nt, nl, nq);     % measured data fitted with an intermediate forced at tau2
+refitTau     = zeros(nq, nRate);
+forcedDchi2  = zeros(nq, 1);
+for q = 1:nq
+    tau = cfg.tauInject(q);
+    [C1, I1] = designMatrix(tt, pN, tau, mdl);
+    M1  = C1 * S + I1 * Delta;
+    [pq, chq] = fitmodel(tt, M1, w, Z, [], pN, -inf(size(pN)), inf(size(pN)), mdl);
+    [~, Sq, Cq] = residMatrix(pq, tt, M1, w, Z, [], mdl);
+    simInjected(:,:,q)  = M1;
+    simNullRefit(:,:,q) = Cq * Sq;
+    pw(q,8)             = chq;
+    refitTau(q,:)       = 1 ./ exp(pq(:)');
+    [pf, chf] = fitmodel(tt, Y, w, Delta, tau, pN, lo, hi, mdl);
+    [~, Sf, Cf, Iforced] = residMatrix(pf, tt, Y, w, Delta, tau, mdl);
+    forcedFit(:,:,q) = Cf * Sf + Iforced * Delta;
+    forcedDchi2(q)   = chf - chiN;
+end
+simAdded      = simInjected - M0;
+simUnabsorbed = simInjected - simNullRefit;
+fprintf('\nTrace pixels: %s nm\n', sprintf('%.1f  ', ww(ixTr)));
+fprintf('Expected dchi2 of the injected intermediates (no noise): %s\n', sprintf('%.1f  ', pw(:,8)));
+
+% 6b. concentration profiles from time zero (fractions of the excited FAD)
+concTime = [0, logspace(-2, log10(cfg.concTmax), 300)]';
+nTc      = numel(concTime);
+concNull = chainconc(concTime, kc);               % chain species without intermediate
+nComp    = nCh + 2;
+concChain = zeros(nTc, nComp, nq);                % chain with the intermediate in column ip+1
+concI = zeros(nTc, nq); concP = zeros(nTc, nq); concRatio = zeros(nTc, nq);
+concSummary = zeros(nq, 6);   % tau2, peak pop, time of peak, I at tmin, I/preceding at tmin, late I/preceding
+for q = 1:nq
+    tau = cfg.tauInject(q);
+    c = chainconc(concTime, [kc(1:ip), 1 / tau, kc(ip+1:end)]);
+    concChain(:,:,q) = c;
+    concI(:,q) = c(:,ip+1);
+    concP(:,q) = c(:,ip+2);                       % species that follows the intermediate
+    concRatio(:,q) = c(:,ip+1) ./ max(c(:,ip), realmin);
+    cm = chainconc(tt(1), [kc(1:ip), 1 / tau, kc(ip+1:end)]);
+    [pkq, tpq, lrq] = intStats(kc, tau, ip);
+    concSummary(q,:) = [tau, pkq, tpq, cm(ip+1), cm(ip+1) / max(cm(ip), realmin), lrq];
+end
+concIscan = zeros(nTc, ng);                       % intermediate population for the profile-scan grid
+for g = 1:ng
+    c = chainconc(concTime, [kc(1:ip), 1 / cfg.tau2grid(g), kc(ip+1:end)]);
+    concIscan(:,g) = c(:,ip+1);
+end
+concEarly = zeros(nTc, mdl.nEarly);               % early components, each starting at 1
+for i = 1:mdl.nEarly
+    concEarly(:,i) = exp(-concTime * k(nCh+i));
+end
+
+%% ------------------------------- 7. optional: reference sample ----------------------
+hasRef = ~isempty(cfg.refDataFile);
+if hasRef
+    [t2, wl2, A2] = readta(cfg.refDataFile, cfg.toMilliOD);
+    if numel(wl2) ~= numel(wl) || max(abs(wl2 - wl)) > 0.5
+        A2 = interp1(wl2(:), A2', wl(:))';        % onto the wavelength grid of the main data
+    end
+    sd2 = std(A2(t2 < cfg.tPre, keep), 0, 1);
+    m2  = t2 >= cfg.tmin;
+    tt2 = t2(m2);  Y2 = A2(m2, keep);
+    if any(isnan(Y2(:))) || any(sd2 == 0) || any(isnan(sd2))
+        error('Reference sample: wavelengths do not cover the main data, or a pixel has no noise estimate.');
+    end
+    refEarly = cfg.refTauEarly;  if isempty(refEarly), refEarly = cfg.tauEarly; end
+    ipR = cfg.refIntPos;         if isempty(ipR), ipR = ip; end
+    mdlR = struct('nChain', numel(cfg.refTau0), 'nEarly', numel(refEarly), 'intPos', ipR);
+    if ipR < 1 || ipR > mdlR.nChain, error('cfg.refIntPos does not fit cfg.refTau0.'); end
+    grpR = noisegroups(tt2, cfg.noiseEdges);
+    [pR, ~, wR, SR, CR, RwR] = nullfit(tt2, Y2, sd2, [cfg.refTau0(:); refEarly(:)]', mdlR);
+    tauRef = 1 ./ exp(pR(:)');
+    mc = ww >= cfg.cmpRange(1) & ww <= cfg.cmpRange(2);
+    Bc = [SR(ipR,mc)', Delta(mc)'] .* w(mc)';
+    co = Bc \ (S(ip,mc) .* w(mc))';            % co(1) = scale a, co(2) = share r
+    resC = (S(ip,mc) - co(1) * SR(ipR,mc) - co(2) * Delta(mc)) .* w(mc);
+    % noise: resample both data sets
+    dofR = numel(Y2) - numel(pR) - numel(SR);
+    noiseR = (RwR ./ wR) * sqrt(numel(Y2) / dofR);
+    MR = CR * SR;  Z2 = zeros(1, nl);
+    rb    = zeros(cfg.nBootCmp, 2);            % scale and r of every replicate
+    rbres = zeros(cfg.nBootCmp, 1);
+    SaB   = zeros(cfg.nBootCmp, nl);           % FAD* spectra of the replicates, main sample
+    SbB   = zeros(cfg.nBootCmp, nl);           % reference sample
+    for b = 1:cfg.nBootCmp
+        Ya = M0 + drawnoise(noiseRows, grp);
+        pa = fitmodel(tt,  Ya, w,  Z,  [], pN, -inf(size(pN)), inf(size(pN)), mdl);
+        [~, Sa] = residMatrix(pa, tt, Ya, w, Z, [], mdl);
+        Yb = MR + drawnoise(noiseR, grpR);
+        pb = fitmodel(tt2, Yb, wR, Z2, [], pR, -inf(size(pR)), inf(size(pR)), mdlR);
+        [~, Sb] = residMatrix(pb, tt2, Yb, wR, Z2, [], mdlR);
+        cb = ([Sb(ipR,mc)', Delta(mc)'] .* w(mc)') \ (Sa(ip,mc) .* w(mc))';
+        rb(b,:)  = cb(:)';
+        rbres(b) = sqrt(mean(((Sa(ip,mc) - cb(1) * Sb(ipR,mc) - cb(2) * Delta(mc)) .* w(mc)).^2));
+        SaB(b,:) = Sa(ip,:);
+        SbB(b,:) = Sb(ipR,:);
+    end
+    sdA  = std(rb(:,1));
+    sdRc = std(rb(:,2));
+    devA = rb(:,1) - mean(rb(:,1));
+    devR = rb(:,2) - mean(rb(:,2));
+    aCI  = co(1) + [quantLinear(devA, aLev / 2), quantLinear(devA, 1 - aLev / 2)];
+    rCI  = co(2) + [quantLinear(devR, aLev / 2), quantLinear(devR, 1 - aLev / 2)];
+    zR   = co(2) / sdRc;
+    % one-sided upper limits for r (a population cannot be negative)
+    rUp        = max(co(2), 0) + quantLinear(devR, cfg.ciLevel);          % noise only
+    rUpCaut    = abs(co(2)) + quantLinear(devR, cfg.ciLevel);             % offset counted as possible systematic error
+    tauUp      = rUp * tauN(ip) / (1 + rUp);          % exact for ip = 1, approximate otherwise
+    tauUpCaut  = rUpCaut * tauN(ip) / (1 + rUpCaut);
+    popUp      = intStats(kc, tauUp, ip);
+    popUpCaut  = intStats(kc, tauUpCaut, ip);
+    resRatio   = sqrt(mean(resC.^2)) / median(rbres);
+    % spectra with their noise per point
+    cmpMain   = S(ip,:);
+    cmpRef    = co(1) * SR(ipR,:);
+    cmpDiff   = cmpMain - cmpRef;
+    sdMain    = std(SaB, 0, 1);
+    sdRefSc   = abs(co(1)) * std(SbB, 0, 1);
+    sdDiff    = std(SaB - co(1) * SbB, 0, 1);
+    cmpZ      = cmpDiff ./ sdDiff;             % difference in units of its noise
+end
+
+%% ------------------------------- 7b. simulated data set as .ana file ----------------
+% One data set built exactly like those of the injection test: fitted model without
+% intermediate + intermediate with lifetime tauAna + one resampled noise matrix.
+% At the detection limit, 95 % of such data sets pass the test; this file is one of them
+% or one of the 5 % that do not. The script tells you which.
+anaWritten = false;
+tauAna = cfg.anaTau;
+if isempty(tauAna), tauAna = tauDet; end
+if cfg.anaExport && isnan(tauAna)
+    fprintf('\nNo .ana file written: the detection probability does not reach 95 %% within cfg.tauInject.\n');
+    fprintf('Set cfg.anaTau to a lifetime in ps or extend cfg.tauInject.\n');
+elseif cfg.anaExport
+    if ~isempty(cfg.anaSeed), rng(cfg.anaSeed); end
+    [Ca, Ia] = designMatrix(tt, pN, tauAna, mdl);
+    anaClean = Ca * S + Ia * Delta;              % mOD, noise-free
+    anaNoise = drawnoise(noiseRows, grp);        % same noise model as in the bootstrap
+    anaData  = anaClean + anaNoise;
+    hAna     = bootstats(anaData, P, tauAna);
+    anaT     = hAna(1);
+    anaPeak  = intStats(kc, tauAna, ip);
+    % best trial lifetime for this data set (same search as in the test)
+    [p0a, c0a] = fitmodel(tt, anaData, w, Z, [], pN, -inf(size(pN)), inf(size(pN)), mdl);
+    chiA = zeros(numel(cfg.bootGrid), 1);
+    for g = 1:numel(cfg.bootGrid)
+        [~, chiA(g)] = fitmodel(tt, anaData, w, Delta, cfg.bootGrid(g), p0a, lo, hi, mdl);
+    end
+    [~, gBest] = min(chiA);
+    anaTauBest = cfg.bootGrid(gBest);
+    if cfg.anaIncludeEarly
+        mEarly = t < tt(1);
+        anaTime  = [t(mEarly); tt];
+        anaOut   = [A(mEarly, keep); anaData] / cfg.toMilliOD;
+        anaOutNF = [A(mEarly, keep); anaClean] / cfg.toMilliOD;
+    else
+        anaTime  = tt;
+        anaOut   = anaData / cfg.toMilliOD;
+        anaOutNF = anaClean / cfg.toMilliOD;
+    end
+    writeana(cfg.anaFile, anaTime, ww, anaOut, cfg.anaNumberScans, cfg.anaDigits);
+    if cfg.anaNoiseFree
+        [fp, fn] = fileparts(cfg.anaFile);
+        writeana(fullfile(fp, [fn '_noisefree.ana']), anaTime, ww, anaOutNF, cfg.anaNumberScans, cfg.anaDigits);
+    end
+    anaWritten = true;
+end
+
+%% ------------------------------- summary -------------------------------------------
+ciPct = 100 * cfg.ciLevel;
+fprintf('\n================ RESULT ================\n');
+for i = 1:nRate
+    if i <= nCh, lifeName = sprintf('Chain lifetime %d', i); else, lifeName = sprintf('Early lifetime %d', i - nCh); end
+    fprintf('%s: %.4g ps (sd %.2g, %.0f %% CI %.4g to %.4g)\n', lifeName, tauN(i), sdTau(i), ciPct, ciTau(1,i), ciTau(2,i));
+end
+fprintf('FAD.- in species %d, cL: %.3f uM cm (%.0f %% CI %.3f to %.3f)\n', ip + 1, x(1), ciPct, ciCL(1,1), ciCL(2,1));
+fprintf('Evidence for an intermediate: statistic %.1f, critical value %.1f (%.0f %% CI %.1f to %.1f), p = %.2f\n', ...
+    Tobs, Tcrit, ciPct, TcritLo, TcritHi, pval);
+if Tobs > Tcrit
+    fprintf('  -> the model WITH intermediate fits significantly better (best tau2 = %.2f ps).\n', prof(imin,1)); %Check null model for missing components abd repeat
+    fprintf('     This shows extra dynamics with a matching spectral signature, not yet the intermediate itself.\n');
+    fprintf('     Check that the best tau2 stays the same when cfg.tmin and cfg.tauEarly are changed,\n');
+    fprintf('     and run the same settings on a sample that cannot form the intermediate.\n');
+else
+    fprintf('  -> no significant evidence for an intermediate.\n');
+end
+fprintf('Detection limit (95 %% detection probability): tau2 = %.2f ps (%.0f %% CI %.2f to %.2f)\n', tauDet, ciPct, tauDetLo, tauDetHi);
+fprintf('   peak population %.1f %% of the excited FAD (%.0f %% CI %.1f to %.1f)\n', 100 * popDet, ciPct, 100 * popDetLo, 100 * popDetHi);
+fprintf('   (NaN = the detection probability does not reach 95 %% within cfg.tauInject)\n');
+fprintf('Measured data exclude tau2 above %.2f ps (peak population above %.1f %%); threshold dchi2 = %.1f\n', tauEx, 100 * popEx, thrEx);
+fprintf('   with the smallest calibrated threshold (%.1f): above %.2f ps (%.1f %%)\n', thrExLo, tauExLo, 100 * popExLo);
+if ~allAbove
+    fprintf('  (warning: dchi2 falls below the threshold again at longer tau2 - look at figure 2)\n');
+end
+fprintf('Faster intermediates follow the decay of %s and are not seen by this test.\n', precLabel);
+fprintf('  Noise limit for their share r with a perfect reference spectrum of %s: sd = %.2f %%\n', precLabel, 100 * sdR);
+
+if hasRef
+    fprintf('\n================ COMPARISON WITH REFERENCE SAMPLE ================\n');
+    fprintf('Reference lifetimes: %s ps\n', sprintf('%.2f  ', tauRef));
+    fprintf('Spectrum of %s = a x reference + r x tied spectrum\n', precLabel);
+    fprintf('  a = %.3f (%.0f %% CI %.3f to %.3f)\n', co(1), ciPct, aCI(1), aCI(2));
+    fprintf('  r = %.2f %% (sd %.2f %%, %.0f %% CI %.2f to %.2f %%), %.1f sd away from zero\n', ...
+        100 * co(2), 100 * sdRc, ciPct, 100 * rCI(1), 100 * rCI(2), zR);
+    fprintf('  r = population of the intermediate / population of %s. Negative values have no\n', precLabel);
+    fprintf('  physical meaning; they show the size of noise or of small spectral differences.\n');
+    fprintf('Residual of the comparison: %.1f x what noise alone gives\n', resRatio);
+    if resRatio < 2
+        fprintf('  -> OK: after scaling, the two spectra agree within noise.\n');
+    else
+        fprintf('  -> WARNING: the two spectra differ in shape beyond noise; r is not reliable.\n');
+    end
+    fprintf('Upper limit for r (one-sided %.0f %%, noise only): %.1f %%  ->  tau2 < %.2f ps, peak population < %.1f %%\n', ...
+        ciPct, 100 * rUp, tauUp, 100 * popUp);
+    fprintf('Cautious limit (observed offset counted as a possible error of either sign): %.1f %%  ->  tau2 < %.2f ps, peak population < %.1f %%\n', ...
+        100 * rUpCaut, tauUpCaut, 100 * popUpCaut);
+    if ip > 1
+        fprintf('  (for cfg.intPos > 1 the conversion from r to tau2 is approximate)\n');
+    end
+end
+
+if anaWritten
+    fprintf('\n================ SIMULATED DATA SET ================\n');
+    fprintf('Written to %s (%d delays from %.2f ps, %d wavelengths; excluded pixels are not included)\n', ...
+        cfg.anaFile, numel(anaTime), anaTime(1), nl);
+    if cfg.anaIncludeEarly
+        fprintf('Delays before %.2f ps are the measured data; the simulation starts there.\n', tt(1));
+    end
+    fprintf('Injected intermediate: tau2 = %.2f ps, peak population %.1f %%\n', tauAna, 100 * anaPeak);
+    fprintf('Test on this data set: T = %.1f, threshold %.1f -> ', anaT, Tcrit);
+    if anaT > Tcrit
+        fprintf('detected; best trial lifetime %.2f ps\n', anaTauBest);
+    else
+        fprintf('NOT detected (one of the rare misses); set cfg.anaSeed to draw other noise\n');
+    end
+end
+
+%% ------------------------------- 8. save results as matrices -----------------------
+out = struct();
+out.cfg = cfg;
+
+% summary table: value, sd, lower and upper end of the confidence interval
+sumRows = cell(0, 1); sumM = zeros(0, 4);
+for i = 1:nRate
+    if i <= nCh
+        sumRows{end+1,1} = sprintf('null lifetime %d (ps)', i); %#ok<SAGROW>
+    else
+        sumRows{end+1,1} = sprintf('early lifetime %d (ps)', i - nCh); %#ok<SAGROW>
+    end
+    sumM(end+1,:) = [tauN(i), sdTau(i), ciTau(1,i), ciTau(2,i)]; %#ok<SAGROW>
+end
+sumRows{end+1,1} = 'excited FAD cL (uM cm)';                 sumM(end+1,:) = [x(1), sdCL(1), ciCL(1,1), ciCL(2,1)];
+sumRows{end+1,1} = 'final radical in product (uM cm)';       sumM(end+1,:) = [x(2), sdCL(2), ciCL(1,2), ciCL(2,2)];
+sumRows{end+1,1} = 'detection statistic, measured data';     sumM(end+1,:) = [Tobs, NaN, NaN, NaN];
+sumRows{end+1,1} = 'detection statistic, critical value';    sumM(end+1,:) = [Tcrit, NaN, TcritLo, TcritHi];
+sumRows{end+1,1} = 'p value of the measured data';           sumM(end+1,:) = [pval, NaN, NaN, NaN];
+sumRows{end+1,1} = 'detection limit tau2 (ps)';              sumM(end+1,:) = [tauDet, NaN, tauDetLo, tauDetHi];
+sumRows{end+1,1} = 'detection limit peak population';        sumM(end+1,:) = [popDet, NaN, popDetLo, popDetHi];
+sumRows{end+1,1} = 'exclusion threshold dchi2';              sumM(end+1,:) = [thrEx, NaN, thrExLo, thrEx];
+sumRows{end+1,1} = 'data exclude tau2 above (ps)';           sumM(end+1,:) = [tauEx, NaN, tauExLo, tauEx];
+sumRows{end+1,1} = 'data exclude peak population above';     sumM(end+1,:) = [popEx, NaN, popExLo, popEx];
+sumRows{end+1,1} = 'noise sd of r with perfect reference';   sumM(end+1,:) = [sdR, NaN, NaN, NaN];
+if hasRef
+    sumRows{end+1,1} = 'reference: scale a';                         sumM(end+1,:) = [co(1), sdA, aCI(1), aCI(2)];
+    sumRows{end+1,1} = 'reference: share r';                         sumM(end+1,:) = [co(2), sdRc, rCI(1), rCI(2)];
+    sumRows{end+1,1} = 'reference: r in units of its sd';            sumM(end+1,:) = [zR, NaN, NaN, NaN];
+    sumRows{end+1,1} = 'reference: residual / noise-only residual';  sumM(end+1,:) = [resRatio, NaN, NaN, NaN];
+    sumRows{end+1,1} = 'reference: upper limit r (noise only)';      sumM(end+1,:) = [rUp, NaN, NaN, NaN];
+    sumRows{end+1,1} = 'reference: upper limit tau2 (ps)';           sumM(end+1,:) = [tauUp, NaN, NaN, NaN];
+    sumRows{end+1,1} = 'reference: upper limit peak population';     sumM(end+1,:) = [popUp, NaN, NaN, NaN];
+    sumRows{end+1,1} = 'reference: cautious upper limit r';          sumM(end+1,:) = [rUpCaut, NaN, NaN, NaN];
+    sumRows{end+1,1} = 'reference: cautious upper limit tau2 (ps)';  sumM(end+1,:) = [tauUpCaut, NaN, NaN, NaN];
+    sumRows{end+1,1} = 'reference: cautious upper limit peak pop';   sumM(end+1,:) = [popUpCaut, NaN, NaN, NaN];
+end
+out.summary      = sumM;
+out.summary_rows = sumRows;
+out.summary_cols = {'value', 'sd', 'ciLow', 'ciHigh'};
+
+% species spectra: wavelength, chain species, early components, noise per point, tied spectrum,
+% sd and CI of the species in front of the intermediate
+specCols = {'wavelength_nm'};
+for i = 1:size(S, 1)
+    if i <= nCh + 1
+        specCols{end+1} = sprintf('species%d_mOD', i); %#ok<SAGROW>
+    else
+        specCols{end+1} = sprintf('early%d_mOD', i - nCh - 1); %#ok<SAGROW>
+    end
+end
+specCols = [specCols, {'noise_sd_mOD', 'Delta_mOD_per_population', [precName '_sd'], [precName '_ciLow'], [precName '_ciHigh']}];
+out.speciesSpectra      = [ww', S', (1 ./ w)', Delta', sdS1', ciS1(1,:)', ciS1(2,:)'];
+out.speciesSpectra_cols = specCols;
+
+out.profileScan      = prof;
+out.profileScan_cols = {'tau2_ps', 'dchi2', 'preceding_lifetime_fitted_ps', 'peak_population'};
+
+out.injectionTest      = pw;
+out.injectionTest_cols = {'tau2_ps', 'peak_population', ['late_ratio_I_to_' precName], 'detection_probability', ...
+                          'detProb_ciLow', 'detProb_ciHigh', 'dchi2_at_truth_q95', 'expected_dchi2_no_noise'};
+
+bootCols = {'T_detection_statistic', 'r_projection'};
+for i = 1:nRate, bootCols{end+1} = sprintf('tau%d_ps', i); end %#ok<SAGROW>
+bootCols = [bootCols, {'cL_uMcm', 'final_radical_uMcm'}];
+out.bootNull        = [H0(:,1), H0(:,3:end), cLboot];
+out.bootNull_cols   = bootCols;
+out.bootInjectedT   = T1;                % rows = replicates, columns = cfg.tauInject
+out.bootInjectedE   = E1;
+out.tauInject       = cfg.tauInject;
+
+% traces at the selected wavelengths (3-D arrays: delay x wavelength x injected tau2)
+out.traceTime        = tt;
+out.traceWavelengths = ww(ixTr);
+out.traceData        = Y(:,ixTr);
+out.traceNullFit     = M0(:,ixTr);
+out.traceNoiseSd     = 1 ./ w(ixTr);
+out.traceInjected    = simInjected(:,ixTr,:);
+out.traceNullRefit   = simNullRefit(:,ixTr,:);
+out.traceAdded       = simAdded(:,ixTr,:);
+out.traceUnabsorbed  = simUnabsorbed(:,ixTr,:);
+out.traceForcedFit   = forcedFit(:,ixTr,:);
+out.forcedDchi2      = forcedDchi2;
+out.refitLifetimes   = refitTau;         % null lifetimes after refitting the injected data
+if anaWritten
+    out.anaTau       = tauAna;           % injected lifetime of the .ana data set
+    out.anaPeak      = anaPeak;
+    out.anaT         = anaT;             % test statistic of that data set
+    out.anaDetected  = anaT > Tcrit;
+    out.anaTauBest   = anaTauBest;       % best trial lifetime found in it
+    out.anaData      = anaData;          % mOD, delays x kept wavelengths
+    out.anaNoiseFree = anaClean;
+end
+
+% full maps (delay x all wavelengths x injected tau2)
+out.wavelength       = ww;
+out.mapData          = Y;
+out.mapNullFit       = M0;
+out.mapInjected      = simInjected;
+out.mapAdded         = simAdded;
+out.mapUnabsorbed    = simUnabsorbed;
+out.mapForcedFit     = forcedFit;
+
+% concentration profiles
+out.concTime         = concTime;
+out.concNull         = concNull;         % chain species without intermediate
+out.concChain        = concChain;        % time x chain species (intermediate in column intPos+1) x injected tau2
+out.concI            = concI;            % time x injected tau2
+out.concP            = concP;            % species that follows the intermediate
+out.concRatio        = concRatio;        % I / preceding species
+out.concEarly        = concEarly;        % early components
+out.intPos           = ip;
+out.lifetimes        = tauN;             % chain lifetimes, then early lifetimes
+out.concSummary      = concSummary;
+out.concSummary_cols = {'tau2_ps', 'peak_population', 'time_of_peak_ps', 'I_at_tmin', 'ratio_at_tmin', 'late_ratio'};
+out.concIscan        = concIscan;        % time x cfg.tau2grid
+out.tau2grid         = cfg.tau2grid;
+
+if hasRef
+    out.comparisonSpectra      = [ww', cmpMain', sdMain', cmpRef', sdRefSc', cmpDiff', sdDiff', ...
+                                  (cmpDiff - zc * sdDiff)', (cmpDiff + zc * sdDiff)', (co(2) * Delta)', cmpZ', double(mc)'];
+    out.comparisonSpectra_cols = {'wavelength_nm', [precName '_main'], 'sd_main', [precName '_ref_scaled'], 'sd_ref_scaled', ...
+                                  'difference', 'sd_difference', 'diff_ciLow', 'diff_ciHigh', 'fitted_r_times_Delta', ...
+                                  'difference_over_sd', 'used_in_fit'};
+    out.bootComparison         = rb;
+    out.bootComparison_cols    = {'scale_a', 'share_r'};
+    out.referenceLifetimes     = tauRef;
+end
+
+save(cfg.resultsFile, '-struct', 'out');
+fprintf('\nResults saved to %s\n', cfg.resultsFile);
+
+needDir = cfg.exportCsv || cfg.saveFigures;
+if needDir && ~exist(cfg.exportDir, 'dir')
+    mkdir(cfg.exportDir);
+end
+
+if cfg.exportCsv
+    try
+        Tsum = array2table(sumM, 'VariableNames', out.summary_cols, 'RowNames', sumRows);
+        writetable(Tsum, fullfile(cfg.exportDir, 'summary.csv'), 'WriteRowNames', true);
+        writecsv(cfg.exportDir, 'species_spectra', out.speciesSpectra, out.speciesSpectra_cols);
+        writecsv(cfg.exportDir, 'profile_scan', out.profileScan, out.profileScan_cols);
+        writecsv(cfg.exportDir, 'injection_test', out.injectionTest, out.injectionTest_cols);
+        writecsv(cfg.exportDir, 'bootstrap_null', out.bootNull, out.bootNull_cols);
+        % one file per trace wavelength
+        for j = 1:nTr
+            M = [tt, Y(:,ixTr(j)), M0(:,ixTr(j)), repmat(1 / w(ixTr(j)), nt, 1)];
+            names = {'time_ps', 'data', 'fit_without_intermediate', 'noise_sd'};
+            blocks = {simInjected, simNullRefit, simAdded, simUnabsorbed, forcedFit};
+            tags   = {'injected_', 'refit_', 'added_', 'unabsorbed_', 'forced_'};
+            for bIdx = 1:numel(blocks)
+                blk = blocks{bIdx};
+                for q = 1:nq
+                    M = [M, blk(:,ixTr(j),q)]; %#ok<AGROW>
+                    names{end+1} = tauTag(tags{bIdx}, cfg.tauInject(q)); %#ok<SAGROW>
+                end
+            end
+            writecsv(cfg.exportDir, sprintf('traces_%dnm', round(ww(ixTr(j)))), M, names);
+        end
+        % concentrations
+        namesI = cell(1, nq); namesP = cell(1, nq); namesR = cell(1, nq);
+        for q = 1:nq
+            namesI{q} = tauTag('I_', cfg.tauInject(q));
+            namesP{q} = tauTag('P_', cfg.tauInject(q));
+            namesR{q} = tauTag('ratio_', cfg.tauInject(q));
+        end
+        nullNames = {'time_ps', 'FADstar'};
+        for i = 2:size(concNull, 2), nullNames{end+1} = sprintf('species%d', i); end %#ok<SAGROW>
+        writecsv(cfg.exportDir, 'concentrations_without_intermediate', [concTime, concNull], nullNames);
+        writecsv(cfg.exportDir, 'concentrations_intermediate', [concTime, concI], [{'time_ps'}, namesI]);
+        writecsv(cfg.exportDir, 'concentrations_product', [concTime, concP], [{'time_ps'}, namesP]);
+        writecsv(cfg.exportDir, ['concentrations_ratio_I_to_' precName], [concTime, concRatio], [{'time_ps'}, namesR]);
+        writecsv(cfg.exportDir, 'concentration_summary', concSummary, out.concSummary_cols);
+        namesS = cell(1, ng);
+        for g = 1:ng, namesS{g} = tauTag('I_', cfg.tau2grid(g)); end
+        writecsv(cfg.exportDir, 'concentrations_intermediate_profile_scan', [concTime, concIscan], [{'time_ps'}, namesS]);
+        if hasRef
+            writecsv(cfg.exportDir, 'comparison_spectra', out.comparisonSpectra, out.comparisonSpectra_cols);
+            writecsv(cfg.exportDir, 'bootstrap_comparison', rb, out.bootComparison_cols);
+        end
+        fprintf('CSV files written to folder %s\n', cfg.exportDir);
+    catch err
+        fprintf('CSV export stopped: %s\n(results are complete in %s)\n', err.message, cfg.resultsFile);
+    end
+end
+
+%% ------------------------------- 9. figures ----------------------------------------
+cols = parula(nq + 1);  cols = cols(1:nq, :);       % one colour per injected tau2
+tauLab = cell(1, nq);
+for q = 1:nq, tauLab{q} = sprintf('%.1f ps', cfg.tauInject(q)); end
+nrTr = ceil(nTr / 2);
+
+% --- figure 1: species spectra
+figure(1); clf;
+shadeband(ww, S(ip,:), sdS1, [0.3 0.5 0.9]);
+plot(ww, S', 'LineWidth', 1.2); plot(ww, zeros(size(ww)), 'k:');
+xlabel('wavelength / nm'); ylabel('\DeltaA / mOD'); title(sprintf('Spectra of the model without intermediate (band: 1 sd of %s)', precLabel));
+lab = cell(1, size(S, 1) + 1);
+lab{1} = [precLabel ' +- 1 sd'];
+for i = 1:size(S, 1)
+    if i <= nCh
+        lab{i+1} = sprintf('species %d, %.4g ps', i, tauN(i));
+    elseif i == nCh + 1
+        lab{i+1} = sprintf('species %d, long-lived', i);
+    else
+        lab{i+1} = sprintf('early component %d, %.3g ps', i - nCh - 1, tauN(i - 1));
+    end
+end
+legend(lab, 'Location', 'best');
+
+% --- figure 2: profile scan on the measured data
+figure(2); clf;
+semilogx(prof(:,1), prof(:,2), 'o-'); hold on;
+semilogx(prof([1 end],1), [thrEx thrEx], 'r--');
+semilogx(prof([1 end],1), [thrExLo thrExLo], 'r:');
+ylim([min(-20, 1.5 * dmin), 5 * thrEx]);
+xlabel('\tau_2 (TyrOH^{.+} lifetime) / ps'); ylabel('\Delta\chi^2 relative to the null model');
+title('Profile scan on the measured data');
+legend('measured data', 'exclusion threshold (largest)', 'exclusion threshold (smallest)', 'Location', 'northwest');
+
+% --- figure 3: injection test with confidence intervals
+figure(3); clf;
+subplot(2, 1, 1);
+errorbar(pw(:,1), 100 * pw(:,4), 100 * (pw(:,4) - pw(:,5)), 100 * (pw(:,6) - pw(:,4)), 's-', 'LineWidth', 1.2); hold on;
+plot(pw([1 end],1), [95 95], 'r--');
+for q = 1:nq
+    text(pw(q,1), -9, sprintf('%.0f %%', 100 * pw(q,2)), 'HorizontalAlignment', 'center', 'FontSize', 8);
+end
+ylim([-16 108]); ylabel('detection probability / %');
+title(sprintf('Injection test with %.0f %% confidence intervals (numbers: peak population)', ciPct));
+subplot(2, 1, 2);
+semilogy(pw(:,1), max(pw(:,8), 1e-2), 'o-', 'LineWidth', 1.2); hold on;
+semilogy(pw([1 end],1), [Tcrit Tcrit], 'r--');
+xlabel('\tau_2 of the injected intermediate / ps'); ylabel('expected \Delta\chi^2 (no noise)');
+legend('injected intermediate', 'false-alarm threshold', 'Location', 'southeast');
+
+% --- figure 4: size of the signal at the detection limit
+figure(4); clf;
+if ~isnan(tauDet)
+    [~, Idet] = designMatrix(tt, pN, tauDet, mdl);
+    plot(ww, Idet(1) * Delta, 'LineWidth', 1.5); hold on;
+    plot(ww, 1 ./ w, 'k:'); plot(ww, -1 ./ w, 'k:');
+    xlabel('wavelength / nm'); ylabel('\DeltaA / mOD');
+    title(sprintf('Signal of the intermediate at %.1f ps for \\tau_2 = %.2f ps, and noise per point', tt(1), tauDet));
+    legend('intermediate minus final state', 'noise (1 sd)', 'Location', 'best');
+end
+
+% --- figure 5: comparison with the reference sample, with noise per point
+if hasRef
+    figure(5); clf;
+    subplot(2, 1, 1);
+    shadeband(ww, cmpMain, sdMain, [0.2 0.4 0.8]);
+    shadeband(ww, cmpRef, sdRefSc, [0.85 0.4 0.1]);
+    h1 = plot(ww, cmpMain, '-', 'Color', [0.2 0.4 0.8], 'LineWidth', 1.2);
+    h2 = plot(ww, cmpRef, '-', 'Color', [0.85 0.4 0.1], 'LineWidth', 1.2);
+    plot(ww, zeros(size(ww)), 'k:');
+    ylabel('\DeltaA / mOD'); title(sprintf('Spectrum of %s: main sample and scaled reference (bands: 1 sd per point)', precLabel));
+    legend([h1 h2], {'main sample', sprintf('reference x %.3f', co(1))}, 'Location', 'best');
+    subplot(2, 1, 2);
+    shadeband(ww, cmpDiff, zc * sdDiff, [0.6 0.6 0.6]);
+    shadeband(ww, cmpDiff, sdDiff, [0.3 0.3 0.3]);
+    h3 = plot(ww, cmpDiff, 'k-', 'LineWidth', 1.2);
+    h4 = plot(ww, co(2) * Delta, 'r-', 'LineWidth', 1.2);
+    h5 = plot(ww, rUp * Delta, 'r--');
+    plot(ww, zeros(size(ww)), 'k:');
+    yl = ylim;
+    plot([cfg.cmpRange(1) cfg.cmpRange(1)], yl, 'k:'); plot([cfg.cmpRange(2) cfg.cmpRange(2)], yl, 'k:');
+    xlabel('wavelength / nm'); ylabel('\DeltaA / mOD');
+    title(sprintf('Difference main - reference (dark band 1 sd, light band %.0f %%); r = %.1f %% (CI %.1f to %.1f %%)', ...
+        ciPct, 100 * co(2), 100 * rCI(1), 100 * rCI(2)));
+    legend([h3 h4 h5], {'difference', 'fitted r x tied spectrum', sprintf('upper limit r = %.1f %%', 100 * rUp)}, 'Location', 'best');
+end
+
+% --- figure 6: traces with injected intermediate
+figure(6); clf;
+for j = 1:nTr
+    subplot(nrTr, 2, j);
+    hd = semilogx(tt, Y(:,ixTr(j)), '.', 'Color', [0.6 0.6 0.6]); hold on;
+    hq = gobjects(1, nq);
+    for q = 1:nq
+        hq(q) = semilogx(tt, simInjected(:,ixTr(j),q), '-', 'Color', cols(q,:));
+    end
+    hn = semilogx(tt, M0(:,ixTr(j)), 'k-', 'LineWidth', 1.5);
+    xlim([tt(1) cfg.traceTmax]);
+    xlabel('delay / ps'); ylabel('\DeltaA / mOD'); title(sprintf('%.0f nm', ww(ixTr(j))));
+    if j == 1
+        legend([hd hn hq], [{'measured data', 'fit without intermediate'}, tauLab], 'Location', 'best', 'FontSize', 6);
+    end
+end
+
+% --- figure 7: what the injection adds and what a refit without intermediate leaves
+figure(7); clf;
+for j = 1:nTr
+    subplot(nrTr, 2, j);
+    sdp = 1 / w(ixTr(j));
+    shadeband(tt', zeros(1, nt), sdp * ones(1, nt), [0.5 0.5 0.5]);
+    for q = 1:nq
+        plot(tt, simAdded(:,ixTr(j),q), '-', 'Color', cols(q,:));
+        plot(tt, simUnabsorbed(:,ixTr(j),q), '--', 'Color', cols(q,:), 'LineWidth', 1.2);
+    end
+    set(gca, 'XScale', 'log'); xlim([tt(1) cfg.traceTmax]);
+    xlabel('delay / ps'); ylabel('\DeltaA / mOD');
+    title(sprintf('%.0f nm: solid = added, dashed = left after refit, band = noise', ww(ixTr(j))));
+end
+
+% --- figure 8: measured residuals and the change when an intermediate is forced into the fit
+figure(8); clf;
+for j = 1:nTr
+    subplot(nrTr, 2, j);
+    semilogx(tt, Y(:,ixTr(j)) - M0(:,ixTr(j)), '.', 'Color', [0.6 0.6 0.6]); hold on;
+    for q = 1:nq
+        semilogx(tt, forcedFit(:,ixTr(j),q) - M0(:,ixTr(j)), '-', 'Color', cols(q,:));
+    end
+    xlim([tt(1) cfg.traceTmax]);
+    xlabel('delay / ps'); ylabel('\DeltaA / mOD');
+    title(sprintf('%.0f nm: data - fit (dots), forced-intermediate fit - fit (lines)', ww(ixTr(j))));
+end
+
+% --- figure 9: where the unabsorbed signal sits (in units of the noise per point)
+figure(9); clf;
+qd = nq;
+if ~isnan(tauDet), [~, qd] = min(abs(cfg.tauInject - tauDet)); end
+pcolor(ww, tt, simUnabsorbed(:,:,qd) .* w); shading flat;
+set(gca, 'YScale', 'log'); ylim([tt(1) cfg.traceTmax]); colorbar;
+xlabel('wavelength / nm'); ylabel('delay / ps');
+title(sprintf('Signal left after refit without intermediate, in noise sd per point (\\tau_2 = %.1f ps)', cfg.tauInject(qd)));
+
+% --- figure 10: concentration profiles
+figure(10); clf;
+ts = concTime(2:end);                       % skip t = 0 on the log axis
+subplot(3, 1, 1);
+hF = semilogx(ts, concNull(2:end,ip), 'k-', 'LineWidth', 1.8); hold on;
+hI = gobjects(1, nq);
+for q = 1:nq, hI(q) = semilogx(ts, concI(2:end,q), '-', 'Color', cols(q,:)); end
+plot([tt(1) tt(1)], [0 1], 'r:');
+ylabel('population'); title(sprintf('%s (black) and intermediate for each injected \\tau_2; red line = start of the fit window', precLabel));
+legend([hF hI], [{precLabel}, tauLab], 'Location', 'eastoutside', 'FontSize', 6);
+subplot(3, 1, 2);
+semilogx(ts, concNull(2:end,ip+1), 'k-', 'LineWidth', 1.8); hold on;
+for q = 1:nq, semilogx(ts, concP(2:end,q), '-', 'Color', cols(q,:)); end
+plot([tt(1) tt(1)], [0 1], 'r:');
+ylabel('population'); title(sprintf('Species %d: without intermediate (black) and delayed by the intermediate', ip + 1));
+subplot(3, 1, 3);
+for q = 1:nq, semilogx(ts, concRatio(2:end,q), '-', 'Color', cols(q,:)); hold on; end
+yl = ylim;
+plot([tt(1) tt(1)], yl, 'r:');
+xlabel('time after excitation / ps'); ylabel(['I / ' precLabel]);
+title(sprintf('Ratio intermediate / %s: once it is flat, the intermediate is hidden under %s', precLabel, precLabel));
+
+if cfg.saveFigures
+    figList = [1 2 3 4 6 7 8 9 10];
+    if hasRef, figList = [figList 5]; end
+    figNames = {'fig01_species_spectra', 'fig02_profile_scan', 'fig03_injection_test', 'fig04_signal_at_limit', ...
+                'fig05_reference_comparison', 'fig06_traces_injected', 'fig07_added_and_unabsorbed', ...
+                'fig08_forced_fit', 'fig09_unabsorbed_map', 'fig10_concentrations'};
+    for i = 1:numel(figList)
+        try
+            print(figure(figList(i)), fullfile(cfg.exportDir, figNames{figList(i)}), '-dpng', '-r200');
+        catch err
+            fprintf('Could not save figure %d: %s\n', figList(i), err.message);
+        end
+    end
+    fprintf('Figures saved to folder %s\n', cfg.exportDir);
+end
+
+%% =============================== local functions ===================================
+function [t, wl, A] = readta(file, scale)
+% first non-empty row = wavelengths, first column = delays
+try
+    M = readmatrix(file, 'Range', 'A1');
+catch
+    M = xlsread(file); %#ok<XLSRD>
+end
+M  = M(~all(isnan(M), 2), :);
+M  = M(:, ~all(isnan(M), 1));
+wl = M(1, 2:end);
+t  = M(2:end, 1);
+A  = M(2:end, 2:end) * scale;
+if any(isnan(A(:))) || any(isnan(t)) || any(isnan(wl))
+    error('The data matrix in %s contains empty cells.', file);
+end
+end
+
+function R = readref(file)
+% numeric block of the reference sheet; the header row is dropped
+try
+    R = readmatrix(file, 'Range', 'A1');
+catch
+    R = xlsread(file); %#ok<XLSRD>
+end
+R = R(~isnan(R(:,1)), :);
+if size(R, 1) < 10
+    R = readmatrix(file);
+    R = R(~isnan(R(:,1)), :);
+end
+end
+
+function s = cell2txt(c)
+if ischar(c), s = c; elseif isstring(c), s = char(c); else, s = '?'; end
+end
+
+function out = binref(refwl, col, ww, binw)
+% average a reference spectrum over the pixel width of the data
+out = zeros(size(ww));
+for i = 1:numel(ww)
+    mm = refwl >= ww(i) - binw / 2 & refwl <= ww(i) + binw / 2;
+    if any(mm)
+        out(i) = mean(col(mm));
+    else
+        out(i) = interp1(refwl, col, ww(i), 'linear', 'extrap');
+    end
+end
+end
+
+function c = chainconc(t, k)
+% linear chain 1 -k(1)-> 2 -k(2)-> ... -> n+1; the last compartment does not decay.
+% Compartment 1 starts with population 1 at t = 0.
+k = k(:)';
+n = numel(k);
+for i = 2:n
+    for j = 1:i-1
+        if abs(k(i) - k(j)) < 1e-6 * k(j)
+            k(i) = k(i) * (1 + 1e-5);
+        end
+    end
+end
+kk = [k, 0];
+E  = exp(-t(:) * kk);
+c  = zeros(numel(t), n + 1);
+for j = 1:n+1
+    pref = prod(kk(1:j-1));
+    for i = 1:j
+        den = 1;
+        for l = 1:j
+            if l ~= i
+                den = den * (kk(l) - kk(i));
+            end
+        end
+        c(:,j) = c(:,j) + pref / den * E(:,i);
+    end
+end
+end
+
+function [C, I] = designMatrix(t, logk, tau2, mdl)
+% columns that get a free spectrum, and the population of the intermediate.
+% logk = log rates of the chain (mdl.nChain values), then of the early components.
+% With tau2, the intermediate is inserted after species mdl.intPos; it shares the
+% free spectrum of the species that follows it.
+k  = exp(logk(:)');
+kc = k(1:mdl.nChain);
+ke = k(mdl.nChain+1:end);
+if isempty(tau2)
+    C = chainconc(t, kc);
+    I = zeros(numel(t), 1);
+else
+    p = mdl.intPos;
+    c = chainconc(t, [kc(1:p), 1 / tau2, kc(p+1:end)]);
+    I = c(:,p+1);
+    C = [c(:,1:p), c(:,p+1) + c(:,p+2), c(:,p+3:end)];
+end
+if ~isempty(ke)
+    C = [C, exp(-t(:) * ke)];
+end
+end
+
+function [Rw, S, C, I] = residMatrix(logk, t, Y, w, Delta, tau2, mdl)
+% weighted residual matrix; the species spectra S are solved linearly
+[C, I] = designMatrix(t, logk, tau2, mdl);
+Yc = Y - I * Delta;
+S  = C \ Yc;
+Rw = (Yc - C * S) .* w;
+end
+
+function r = residVector(logk, t, Y, w, Delta, tau2, mdl)
+Rw = residMatrix(logk, t, Y, w, Delta, tau2, mdl);
+r  = Rw(:);
+end
+
+function [p, chi2] = fitmodel(t, Y, w, Delta, tau2, p0, lo, hi, mdl)
+fun = @(q) residVector(q, t, Y, w, Delta, tau2, mdl);
+[p, chi2] = lmfit(fun, p0, lo, hi);
+end
+
+function [p, f] = lmfit(fun, p0, lo, hi)
+% Levenberg-Marquardt with forward-difference Jacobian and box limits
+lo = lo(:); hi = hi(:);
+p  = min(max(p0(:), lo), hi);
+r  = fun(p);
+f  = r' * r;
+lam = 1e-3;
+np  = numel(p);
+for it = 1:60
+    J = zeros(numel(r), np);
+    for j = 1:np
+        dp = zeros(np, 1);
+        dp(j) = 1e-6 * max(1, abs(p(j)));
+        J(:,j) = (fun(p + dp) - r) / dp(j);
+    end
+    g = J' * r;
+    H = J' * J;
+    improved = false;
+    rel = 0;
+    for inner = 1:12
+        step = -(H + lam * diag(diag(H))) \ g;
+        step = min(max(step, -1), 1);
+        pn = min(max(p + step, lo), hi);
+        rn = fun(pn);
+        fn = rn' * rn;
+        if fn < f
+            improved = true;
+            rel = (f - fn) / f;
+            p = pn; r = rn; f = fn;
+            lam = max(lam / 5, 1e-9);
+            break
+        end
+        lam = lam * 5;
+    end
+    if ~improved || rel < 1e-9
+        break
+    end
+end
+end
+
+function [p, chi2, w, S, C, Rw] = nullfit(t, Y, sd, tau0, mdl)
+% null model with three rounds of re-weighting from the residual scatter per wavelength
+[nt, nl] = size(Y);
+Z = zeros(1, nl);
+w = 1 ./ sd;
+p = log(1 ./ tau0(:));
+lo = -inf(size(p)); hi = inf(size(p));
+for it = 1:4
+    [p, chi2] = fitmodel(t, Y, w, Z, [], p, lo, hi, mdl);
+    [Rw, S, C] = residMatrix(p, t, Y, w, Z, [], mdl);
+    if it < 4
+        w = w ./ sqrt(mean(Rw.^2, 1) * nt / (nt - size(C, 2) - numel(p) / nl));
+    end
+end
+end
+
+function [pk, tpk, lateRatio] = intStats(kc, tau2, p)
+% intermediate inserted after species p of the chain with rates kc:
+% peak population, time of the peak, and the ratio intermediate / preceding species
+% at the time when the preceding species has dropped to 0.1 % of its maximum
+kc = kc(:)';
+tg = [0, logspace(-3, log10(50 * max(1 ./ kc(1:p)) + 50 * tau2), 4000)]';
+c  = chainconc(tg, [kc(1:p), 1 / tau2, kc(p+1:end)]);
+[pk, ipk] = max(c(:,p+1));
+tpk  = tg(ipk);
+prev = c(:,p);
+il   = find(prev > 1e-3 * max(prev), 1, 'last');
+lateRatio = c(il,p+1) / prev(il);
+end
+
+function grp = noisegroups(t, edges)
+% group number of every delay; noise is resampled within groups
+grp = ones(numel(t), 1);
+for i = 1:numel(edges)
+    grp = grp + (t(:) >= edges(i));
+end
+end
+
+function N = drawnoise(noiseRows, grp)
+% resample whole residual spectra (keeps the spectral correlation), random sign.
+% Delays are exchanged only within their group.
+nt = size(noiseRows, 1);
+ug = unique(grp);
+if numel(ug) == 1
+    idx = randi(nt, nt, 1);
+else
+    idx = zeros(nt, 1);
+    for g = 1:numel(ug)
+        mem = find(grp == ug(g));
+        idx(mem) = mem(randi(numel(mem), numel(mem), 1));
+    end
+end
+sg = 2 * (rand(nt, 1) > 0.5) - 1;
+N  = noiseRows(idx, :) .* sg;
+end
+
+function [out, s1, cl] = bootstats(Yb, P, tauTrue)
+% detection statistic T = chi2(null) - min over tau2 of chi2(with intermediate)
+% s1 = spectrum of the species in front of the intermediate, cl = [cL, final radical]
+% from the spectrum of the species behind it
+Z = zeros(1, size(Yb, 2));
+[p0, c0] = fitmodel(P.t, Yb, P.w, Z, [], P.pN, -inf(size(P.pN)), inf(size(P.pN)), P.mdl);
+best = inf;
+for g = 1:numel(P.grid)
+    [~, c1] = fitmodel(P.t, Yb, P.w, P.Delta, P.grid(g), p0, P.lo, P.hi, P.mdl);
+    best = min(best, c1);
+end
+E = NaN;
+if ~isempty(tauTrue)
+    [~, ct] = fitmodel(P.t, Yb, P.w, P.Delta, tauTrue, p0, P.lo, P.hi, P.mdl);
+    E = ct - min([c0, best, ct]);
+end
+[~, Sb] = residMatrix(p0, P.t, Yb, P.w, Z, [], P.mdl);
+ip = P.mdl.intPos;
+Dw = P.Delta .* P.w;
+rproj = ((Sb(ip,:) - P.S(ip,:)) .* P.w) * Dw' / (Dw * Dw');
+out = [c0 - best, E, rproj, 1 ./ exp(p0(:)')];
+if nargout > 1
+    s1 = Sb(ip,:);
+end
+if nargout > 2
+    xb = lsqnonneg(P.Bw, (Sb(ip+1,P.mk) .* P.w(P.mk))');
+    cl = xb(:)';
+end
+end
+
+function q = quantLinear(x, pr)
+% quantile with linear interpolation (no toolbox needed)
+x = sort(x(:));
+n = numel(x);
+pos = (n - 1) * pr + 1;
+a = floor(pos); b = ceil(pos);
+q = x(a) + (x(b) - x(a)) * (pos - a);
+end
+
+function q = quantCols(X, pr)
+% quantile of every column
+q = zeros(1, size(X, 2));
+for j = 1:size(X, 2)
+    q(j) = quantLinear(X(:,j), pr);
+end
+end
+
+function [lo, hi] = wilson(p, n, z)
+% Wilson score interval for a proportion p observed in n trials
+den = 1 + z^2 / n;
+cen = (p + z^2 / (2 * n)) / den;
+hw  = z * sqrt(p .* (1 - p) / n + z^2 / (4 * n^2)) / den;
+lo  = max(cen - hw, 0);
+hi  = min(cen + hw, 1);
+end
+
+function x0 = interpCross(x, y, level)
+% first x at which y reaches the level (linear interpolation); NaN if it never does
+x0 = NaN;
+i = find(y >= level, 1, 'first');
+if isempty(i)
+    return
+end
+if i == 1
+    x0 = x(1);
+    return
+end
+f  = (level - y(i-1)) / (y(i) - y(i-1));
+x0 = x(i-1) + f * (x(i) - x(i-1));
+end
+
+function [tauEx, popEx, allAbove] = crossProfile(prof, thr)
+% first tau2 of the profile scan at which dchi2 exceeds the threshold
+tauEx = NaN; popEx = NaN; allAbove = false;
+ie = find(prof(:,2) > thr, 1, 'first');
+if isempty(ie) || ie == 1
+    return
+end
+f = (thr - prof(ie-1,2)) / (prof(ie,2) - prof(ie-1,2));
+tauEx = exp(log(prof(ie-1,1)) + f * (log(prof(ie,1)) - log(prof(ie-1,1))));
+popEx = interp1(log(prof(:,1)), prof(:,4), log(tauEx));
+allAbove = all(prof(ie:end,2) > thr);
+end
+
+function writeana(file, t, wl, A, nScans, digits)
+% .ana file in TAVIS layout: header lines, then one row of intensities per delay
+fid = fopen(file, 'w');
+if fid < 0
+    error('Cannot open %s for writing.', file);
+end
+[~, name] = fileparts(file);
+fmt = ['%.' num2str(digits) 'g'];
+fprintf(fid, '%%FILENAME=%s\n', name);
+fprintf(fid, '%%DATATYPE=TAVIS\n');
+fprintf(fid, '%%NUMBERSCANS=%d\n', nScans);
+fprintf(fid, '%%TIMESCALE=ps\n');
+fprintf(fid, '%%TIMELIST=%s\n', numline(t, fmt));
+fprintf(fid, '%%WAVELENGTHLIST=%s\n', numline(wl, fmt));
+fprintf(fid, '%%INTENSITYMATRIX=\n');
+for i = 1:size(A, 1)
+    fprintf(fid, '%s\n', numline(A(i,:), fmt));
+end
+fclose(fid);
+end
+
+function s = numline(x, fmt)
+% numbers separated by single spaces
+s = sprintf([fmt ' '], x);
+s = s(1:end-1);
+end
+
+function s = tauTag(prefix, tau)
+% column name such as injected_0p600ps
+s = [prefix strrep(sprintf('%.3f', tau), '.', 'p') 'ps'];
+end
+
+function writecsv(folder, name, M, colnames)
+% matrix with a header line
+T = array2table(M, 'VariableNames', colnames);
+writetable(T, fullfile(folder, [name '.csv']));
+end
+
+function shadeband(x, y, e, col)
+% shaded band y +- e; leaves hold on
+x = x(:)'; y = y(:)'; e = e(:)';
+fill([x, fliplr(x)], [y - e, fliplr(y + e)], col, 'EdgeColor', 'none', 'FaceAlpha', 0.25);
+hold on;
+end
+
+
